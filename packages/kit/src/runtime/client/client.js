@@ -222,12 +222,23 @@ const invalidated = [];
  */
 const components = [];
 
-/** @type {{id: string, token: {}, promise: Promise<import('./types.js').NavigationResult>, fork: Promise<import('svelte').Fork | null> | null} | null} */
+/** @type {{id: string, token: {}, promise: Promise<import('./types.js').NavigationResult>, fork: Promise<import('svelte').Fork | null> | null, expires: number} | null} */
 let load_cache = null;
+
+const PRELOAD_MAX_AGE = 10_000;
 
 function discard_load_cache() {
 	void load_cache?.fork?.then((f) => f?.discard());
 	load_cache = null;
+}
+
+/** @param {string} id */
+function get_fresh_load_cache(id) {
+	if (load_cache?.id !== id) return null;
+	if (Date.now() < load_cache.expires) return load_cache;
+
+	discard_load_cache();
+	return null;
 }
 
 /**
@@ -544,48 +555,53 @@ async function _preload_data(intent) {
 	// Prevents an edge case where same preload is triggered multiple times,
 	// then a later one is becoming the real navigation and the preload tokens
 	// get out of sync.
-	if (intent.id !== load_cache?.id) {
-		discard_load_cache();
+	const cached = get_fresh_load_cache(intent.id);
+	if (cached) return cached.promise;
 
-		const preload = {};
-		preload_tokens.add(preload);
-		load_cache = {
-			id: intent.id,
-			token: preload,
-			promise: load_route({ ...intent, preload }).then((result) => {
-				preload_tokens.delete(preload);
-				if (result.type === 'loaded' && result.state.error) {
-					// Don't cache errors, because they might be transient
-					discard_load_cache();
+	discard_load_cache();
+
+	const preload = {};
+	preload_tokens.add(preload);
+
+	/** @type {NonNullable<typeof load_cache>} */
+	const lc = {
+		id: intent.id,
+		token: preload,
+		promise: load_route({ ...intent, preload }).then((result) => {
+			preload_tokens.delete(preload);
+			lc.expires = Date.now() + PRELOAD_MAX_AGE;
+			if (result.type === 'loaded' && result.state.error) {
+				// Don't cache errors, because they might be transient
+				discard_load_cache();
+			}
+			return result;
+		}),
+		fork: null,
+		expires: Infinity
+	};
+
+	load_cache = lc;
+
+	if (__SVELTEKIT_FORK_PRELOADS__ && svelte.fork) {
+		lc.fork = lc.promise.then((result) => {
+			// if load_cache was discarded before load_cache.promise could
+			// resolve, bail rather than creating an orphan fork
+			if (lc === load_cache && result.type === 'loaded') {
+				try {
+					return svelte.fork(() => {
+						root.$set(result.props);
+						update(result.props.page);
+					});
+				} catch {
+					// if it errors, it's because the experimental flag isn't enabled in Svelte
 				}
-				return result;
-			}),
-			fork: null
-		};
+			}
 
-		if (__SVELTEKIT_FORK_PRELOADS__ && svelte.fork) {
-			const lc = load_cache;
-
-			lc.fork = lc.promise.then((result) => {
-				// if load_cache was discarded before load_cache.promise could
-				// resolve, bail rather than creating an orphan fork
-				if (lc === load_cache && result.type === 'loaded') {
-					try {
-						return svelte.fork(() => {
-							root.$set(result.props);
-							update(result.props.page);
-						});
-					} catch {
-						// if it errors, it's because the experimental flag isn't enabled in Svelte
-					}
-				}
-
-				return null;
-			});
-		}
+			return null;
+		});
 	}
 
-	return load_cache.promise;
+	return lc.promise;
 }
 
 /**
@@ -1104,10 +1120,11 @@ function preload_error({ error, url, route, params }) {
  * @returns {Promise<import('./types.js').NavigationResult>}
  */
 async function load_route({ id, invalidating, url, params, route, preload }) {
-	if (load_cache?.id === id) {
+	const cached = get_fresh_load_cache(id);
+	if (cached) {
 		// the preload becomes the real navigation
-		preload_tokens.delete(load_cache.token);
-		return load_cache.promise;
+		preload_tokens.delete(cached.token);
+		return cached.promise;
 	}
 
 	const { errors, layouts, leaf } = route;
